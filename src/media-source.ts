@@ -203,6 +203,52 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
+/**
+ * If the input frame is in an RGB pixel format (e.g. produced by decoding a GBRP source), the
+ * browser's WebCodecs `VideoEncoder` will silently convert RGB→YUV when encoding to a YUV-based
+ * codec like AVC/H.264. However, the resulting bitstream often lacks proper VUI color tags
+ * (`colour_primaries`, `transfer_characteristics`, `matrix_coefficients`, `video_full_range_flag`),
+ * causing players to fall back to inconsistent defaults — typically producing washed-out or
+ * over-saturated colors.
+ *
+ * This helper rebuilds the frame with explicit BT.709 limited range color metadata (the standard
+ * for HD SDR content), which causes the encoder to write the correct VUI parameters into the
+ * bitstream so playback is consistent across players.
+ *
+ * Returns `null` if no normalization is needed (frame is already YUV) or if the operation fails
+ * (in which case the caller should fall back to the original frame, preserving prior behavior).
+ */
+async function normalizeRgbFrameColorSpace(frame: VideoFrame): Promise<VideoFrame | null> {
+	const format = frame.format;
+	if (!format) return null;
+
+	// Only RGB-family formats need normalization. YUV (I420, NV12, etc.) is already correctly tagged.
+	const isRgbFormat = /^(?:RGB|BGR)/.test(format);
+	if (!isRgbFormat) return null;
+
+	try {
+		const allocSize = frame.allocationSize();
+		const buffer = new ArrayBuffer(allocSize);
+		await frame.copyTo(buffer);
+
+		return new VideoFrame(buffer, {
+			format,
+			codedWidth: frame.codedWidth,
+			codedHeight: frame.codedHeight,
+			timestamp: frame.timestamp,
+			duration: frame.duration ?? undefined,
+			colorSpace: {
+				primaries: 'bt709',
+				transfer: 'iec61966-2-1',
+				matrix: 'bt709',
+				fullRange: false,
+			},
+		});
+	} catch {
+		return null;
+	}
+}
+
 class VideoEncoderWrapper {
 	private ensureEncoderPromise: Promise<void> | null = null;
 	private encoderInitialized = false;
@@ -353,21 +399,31 @@ class VideoEncoderWrapper {
 
 				const videoFrame = videoSample.toVideoFrame();
 
+				// Normalize color space for RGB-source frames (e.g. GBRP). Without an explicit YUV color
+				// space hint, browsers emit YUV bitstreams without (or with incorrect) VUI color tags,
+				// which causes players to mis-interpret the range/matrix and produce washed-out or
+				// over-saturated colors. Re-tag the frame as BT.709 limited range (the standard for HD
+				// SDR content) so the encoder writes correct VUI parameters into the output bitstream.
+				const normalizedFrame = await normalizeRgbFrameColorSpace(videoFrame);
+				const frameToEncode = normalizedFrame ?? videoFrame;
+
 				if (!this.alphaEncoder) {
 					// No alpha encoder, simple case
-					this.encoder.encode(videoFrame, finalEncodeOptions);
-					videoFrame.close();
+					this.encoder.encode(frameToEncode, finalEncodeOptions);
+					if (normalizedFrame) videoFrame.close();
+					frameToEncode.close();
 				} else {
 					// We're expected to encode alpha as well
-					const frameDefinitelyHasNoAlpha = !!videoFrame.format && !videoFrame.format.includes('A');
+					const frameDefinitelyHasNoAlpha = !!frameToEncode.format && !frameToEncode.format.includes('A');
 
 					if (frameDefinitelyHasNoAlpha || this.splitterCreationFailed) {
 						this.alphaFrameQueue.push(null);
-						this.encoder.encode(videoFrame, finalEncodeOptions);
-						videoFrame.close();
+						this.encoder.encode(frameToEncode, finalEncodeOptions);
+						if (normalizedFrame) videoFrame.close();
+						frameToEncode.close();
 					} else {
-						const width = videoFrame.displayWidth;
-						const height = videoFrame.displayHeight;
+						const width = frameToEncode.displayWidth;
+						const height = frameToEncode.displayHeight;
 
 						if (!this.splitter) {
 							try {
@@ -377,19 +433,21 @@ class VideoEncoderWrapper {
 
 								this.splitterCreationFailed = true;
 								this.alphaFrameQueue.push(null);
-								this.encoder.encode(videoFrame, finalEncodeOptions);
-								videoFrame.close();
+								this.encoder.encode(frameToEncode, finalEncodeOptions);
+								if (normalizedFrame) videoFrame.close();
+								frameToEncode.close();
 							}
 						}
 
 						if (this.splitter) {
-							const colorFrame = this.splitter.extractColor(videoFrame);
-							const alphaFrame = this.splitter.extractAlpha(videoFrame);
+							const colorFrame = this.splitter.extractColor(frameToEncode);
+							const alphaFrame = this.splitter.extractAlpha(frameToEncode);
 
 							this.alphaFrameQueue.push(alphaFrame);
 							this.encoder.encode(colorFrame, finalEncodeOptions);
 							colorFrame.close();
-							videoFrame.close();
+							if (normalizedFrame) videoFrame.close();
+							frameToEncode.close();
 						}
 					}
 				}
